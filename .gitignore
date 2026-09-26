@@ -27,3 +27,4 @@ $RECYCLE.BIN/
 .idea/
 *.sublime-project
 *.sublime-workspace
+*.exe
