@@ -285,264 +285,212 @@ def unpack_archive(archive_path, output_dir=None, verbose=True):
         raw_f.close()
 
 
-def pack_archive(input_dir, output_path=None, format_type='dsar', verbose=True):
+ALIGN_THRESHOLD = 2 * 1024 * 1024   # files larger than this start on a 64 KiB boundary (as in the original archives)
+ALIGN = 0x10000
+CHUNK_MAX = 262144
+
+
+def read_manifest(path):
+    """Filenames.txt may be newline- or NUL-separated (UnPSARC writes NULs)."""
+    with open(path, 'rb') as f:
+        raw = f.read()
+    names = []
+    for part in raw.replace(b'\r', b'\n').replace(b'\x00', b'\n').split(b'\n'):
+        s = part.decode('utf-8', errors='replace').strip()
+        if s:
+            names.append(s if s.startswith('/') else '/' + s)
+    return names
+
+
+def pack_archive(input_dir, output_path=None, format_type='dsar', verbose=True, add_new=False):
     """
     Repacks an unpacked directory back into a Ghost of Tsushima PSARC (DSAR/PSAR).
+
+    Layout rules copied from the original game archives:
+      * file order = Filenames.txt order, TOC entries sorted by MD5 of the name
+      * files larger than 2 MiB start on a 64 KiB boundary; the gap is a zero
+        block (zsize entry = gap length, DSAR chunk flag 254)
+      * every file starts and ends on a DSAR chunk boundary, chunks <= 256 KiB,
+        all chunks LZ4 (flag 3), chunk data 16-byte aligned
     """
     if not os.path.isdir(input_dir):
         raise ValueError(f"Input directory does not exist: {input_dir}")
-
     if output_path is None:
-        norm = os.path.normpath(input_dir)
-        output_path = norm + ".psarc"
+        output_path = os.path.normpath(input_dir) + ".psarc"
 
     t0 = time.time()
     filenames_txt = os.path.join(input_dir, 'Filenames.txt')
+    file_names = read_manifest(filenames_txt) if os.path.isfile(filenames_txt) else []
 
-    file_names = []
-    if os.path.isfile(filenames_txt):
-        with open(filenames_txt, 'r', encoding='utf-8') as f:
-            for line in f:
-                stripped = line.strip()
-                if stripped:
-                    file_names.append(stripped)
-
-    # Scan directory for any extra or modified files
     scanned_map = {}
     for root, dirs, files in os.walk(input_dir):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
         for file in files:
             if file == 'Filenames.txt':
                 continue
             full_path = os.path.join(root, file)
-            rel_path = os.path.relpath(full_path, input_dir).replace('\\', '/')
-            canon_name = '/' + rel_path
-            scanned_map[canon_name.lower()] = (canon_name, full_path)
+            canon = '/' + os.path.relpath(full_path, input_dir).replace('\\', '/')
+            scanned_map[canon.lower()] = (canon, full_path)
 
-    # Reconcile files: start with Filenames.txt order, then add new ones
-    ordered_files = []
-    seen = set()
+    ordered_files, seen, missing = [], set(), []
     for fn in file_names:
         key = fn.lower()
+        if key in seen:
+            continue
         if key in scanned_map:
-            canon_name, full_path = scanned_map[key]
-            ordered_files.append((canon_name, full_path))
+            ordered_files.append((fn, scanned_map[key][1]))
             seen.add(key)
         else:
-            rel = fn.lstrip('/')
-            full_path = os.path.join(input_dir, rel.replace('/', os.sep))
-            if os.path.isfile(full_path):
-                ordered_files.append((fn, full_path))
-                seen.add(key)
+            missing.append(fn)
+    if missing:
+        raise ValueError(f"{len(missing)} file(s) listed in Filenames.txt are missing, e.g. {missing[0]}")
 
-    for key, (canon_name, full_path) in scanned_map.items():
-        if key not in seen:
-            ordered_files.append((canon_name, full_path))
-
+    extras = [v for k, v in scanned_map.items() if k not in seen]
+    if extras:
+        if add_new or not file_names:
+            ordered_files.extend(sorted(extras))
+        elif verbose:
+            print(f"[!] Ignoring {len(extras)} file(s) not listed in Filenames.txt "
+                  f"(e.g. {extras[0][0]}). Use --add-new to include them.")
     if not ordered_files:
         raise ValueError(f"No files found to pack in {input_dir}")
 
-    # Gather file metadata
-    file_records = []
-    total_raw_bytes = 0
-    for canon_name, full_path in ordered_files:
-        sz = os.path.getsize(full_path)
-        file_records.append((canon_name, full_path, sz))
-        total_raw_bytes += sz
-
+    file_records = [(c, p, os.path.getsize(p)) for c, p in ordered_files]
+    total_raw = sum(r[2] for r in file_records)
     if verbose:
         print(f"[+] Packing directory: {input_dir}")
         print(f"    Target Archive: {output_path} | Format: {format_type.upper()}")
-        print(f"    Total Files: {len(file_records)} | Total Uncompressed Size: {total_raw_bytes / (1024*1024):.2f} MB")
+        print(f"    Total Files: {len(file_records)} | Total Uncompressed Size: {total_raw / (1024*1024):.2f} MB")
 
-    # Build Filenames table for Entry 0
-    all_canon_names = [r[0] for r in file_records]
-    filenames_bytes = b'\x00'.join(fn.encode('utf-8') for fn in all_canon_names)
-
+    filenames_bytes = b'\x00'.join(c.encode('utf-8') for c, _, _ in file_records)
     num_entries = len(file_records) + 1
     entry_sz = 30
     block_sz = 65536
 
-    # Calculate zsizes
-    all_zsizes = []
+    # ---- plan: zsizes, offsets (TOC size depends on zsizes count, offsets on TOC size)
+    def blocks(n):
+        out = []
+        for i in range(0, n, block_sz):
+            b = min(block_sz, n - i)
+            out.append(0 if b == block_sz else b)
+        return out or [0]
 
-    # Entry 0 zsizes (uncompressed)
-    for i in range(0, len(filenames_bytes), block_sz):
-        blk_len = min(block_sz, len(filenames_bytes) - i)
-        all_zsizes.append(0 if blk_len == block_sz else blk_len)
-    if not all_zsizes:
-        all_zsizes = [0]
+    def plan(toc_sz):
+        zs = blocks(len(filenames_bytes))
+        cur = toc_sz + len(filenames_bytes)
+        recs = []
+        for canon, path, sz in file_records:
+            gap = 0
+            if sz > ALIGN_THRESHOLD and cur % ALIGN:
+                gap = ALIGN - cur % ALIGN
+                zs.append(gap)
+                cur += gap
+            recs.append((canon, path, sz, len(zs), cur, gap))
+            zs.extend(blocks(sz))
+            cur += sz
+        return zs, recs, cur
 
-    # File zsizes
-    files_with_meta = []
-    for canon_name, full_path, sz in file_records:
-        zidx = len(all_zsizes)
-        if sz == 0:
-            all_zsizes.append(0)
-        else:
-            for i in range(0, sz, block_sz):
-                blk_len = min(block_sz, sz - i)
-                all_zsizes.append(0 if blk_len == block_sz else blk_len)
-        files_with_meta.append((canon_name, full_path, sz, zidx))
+    toc_sz = 32 + num_entries * entry_sz
+    for _ in range(10):
+        zs, recs, total_uncomp = plan(toc_sz)
+        new_toc = 32 + num_entries * entry_sz + 2 * len(zs)
+        if new_toc == toc_sz:
+            break
+        toc_sz = new_toc
+    else:
+        raise RuntimeError("could not converge TOC layout")
 
-    toc_sz = 32 + num_entries * entry_sz + len(all_zsizes) * 2
     e0_off = toc_sz
-    curr_uoff = toc_sz + len(filenames_bytes)
+    entries = [(b'\x00' * 16, 0, len(filenames_bytes), e0_off)]
+    for canon, path, sz, zidx, off, gap in recs:
+        entries.append((hashlib.md5(canon.encode('utf-8')).digest(), zidx, sz, off))
+    entries = [entries[0]] + sorted(entries[1:], key=lambda e: e[0])
 
-    # Build entries list
-    entries_list = [(16 * b'\x00', 0, len(filenames_bytes), e0_off)]
-
-    final_file_records = []
-    for canon_name, full_path, sz, zidx in files_with_meta:
-        h = hashlib.md5(canon_name.encode('utf-8')).digest()
-        off = curr_uoff
-        entries_list.append((h, zidx, sz, off))
-        final_file_records.append((canon_name, full_path, sz, zidx, off))
-        curr_uoff += sz
-
-    # Sort entries 1..N by MD5 hash
-    sorted_entries = [entries_list[0]] + sorted(entries_list[1:], key=lambda x: x[0])
-
-    # Build PSAR TOC
-    psar_hdr = struct.pack('>4sHH4sIIIII', b'PSAR', 1, 4, b'zlib', toc_sz, entry_sz, num_entries, block_sz, 14)
-    entries_bytes = bytearray()
-    for h, zidx, usz, off in sorted_entries:
-        entries_bytes += h + struct.pack('>I', zidx) + usz.to_bytes(5, 'big') + off.to_bytes(5, 'big')
-
-    zsizes_bytes = bytearray()
-    for zs in all_zsizes:
-        zsizes_bytes += struct.pack('>H', zs)
-
-    toc_data = bytes(psar_hdr) + bytes(entries_bytes) + bytes(zsizes_bytes)
+    toc = bytearray(struct.pack('>4sHH4sIIIII', b'PSAR', 1, 4, b'zlib', toc_sz, entry_sz, num_entries, block_sz, 14))
+    for h, zidx, usz, off in entries:
+        toc += h + struct.pack('>I', zidx) + usz.to_bytes(5, 'big') + off.to_bytes(5, 'big')
+    for z in zs:
+        toc += struct.pack('>H', z)
+    toc_data = bytes(toc)
     assert len(toc_data) == toc_sz
 
-    CHUNK_MAX = 262144
+    temp_output = output_path + ".tmp"
+    fmt = format_type.lower()
+    if fmt == 'dsar':
+        chunks = []   # (uoff, coff, usz, csz, flag)
 
-    if format_type.lower() == 'dsar':
-        # DirectStorage DSAR container
-        chunk_count = 2  # TOC + Entry 0
-        for _, _, sz, _, _ in final_file_records:
-            if sz == 0:
-                chunk_count += 1
-            else:
-                chunk_count += (sz + CHUNK_MAX - 1) // CHUNK_MAX
+        # count chunks first to know where data starts
+        n_chunks = 2
+        for canon, path, sz, zidx, off, gap in recs:
+            n_chunks += (1 if gap else 0) + (sz + CHUNK_MAX - 1) // CHUNK_MAX
+        first_chunk_offset = (32 + n_chunks * 32 + 15) & ~15
 
-        first_chunk_offset = (32 + chunk_count * 32 + 15) & ~15
-        total_uncomp = curr_uoff
-
-        chunks_meta = []  # (uoff, coff, usz, csz, cflag)
-
-        temp_output = output_path + ".tmp"
         with open(temp_output, 'wb') as out_f:
-            out_f.seek(first_chunk_offset)
-            cur_coff = first_chunk_offset
+            out_f.write(b'\x00' * first_chunk_offset)
+            cur = first_chunk_offset
 
-            # Chunk 0: PSAR TOC
-            c_toc = lz4.block.compress(toc_data, store_size=False)
-            cflag = 3 if len(c_toc) < len(toc_data) else 0
-            cdata = c_toc if cflag == 3 else toc_data
-            csz = len(cdata)
-            out_f.write(cdata)
-            chunks_meta.append((0, cur_coff, len(toc_data), csz, cflag))
-            cur_coff += csz
-            pad = (16 - (cur_coff % 16)) % 16
-            if pad:
-                out_f.write(b'\x00' * pad)
-                cur_coff += pad
+            def put(uoff, buf):
+                nonlocal cur
+                c = lz4.block.compress(buf, store_size=False)
+                out_f.write(c)
+                chunks.append((uoff, cur, len(buf), len(c), 3))
+                cur += len(c)
+                pad = (-cur) % 16
+                if pad:
+                    out_f.write(b'\x00' * pad)
+                    cur += pad
 
-            # Chunk 1: Entry 0 (filenames)
-            c_fn = lz4.block.compress(filenames_bytes, store_size=False)
-            cflag = 3 if len(c_fn) < len(filenames_bytes) else 0
-            cdata = c_fn if cflag == 3 else filenames_bytes
-            csz = len(cdata)
-            out_f.write(cdata)
-            chunks_meta.append((e0_off, cur_coff, len(filenames_bytes), csz, cflag))
-            cur_coff += csz
-            pad = (16 - (cur_coff % 16)) % 16
-            if pad:
-                out_f.write(b'\x00' * pad)
-                cur_coff += pad
-
-            # Chunks for each file
-            file_idx = 0
-            for canon_name, full_path, sz, zidx, off in final_file_records:
-                file_idx += 1
-                if sz == 0:
-                    chunks_meta.append((off, 0, 0, 0, 254))
-                    continue
-
-                with open(full_path, 'rb') as in_f:
-                    file_uoff = off
+            put(0, toc_data)
+            put(e0_off, filenames_bytes)
+            for i, (canon, path, sz, zidx, off, gap) in enumerate(recs, 1):
+                if gap:
+                    chunks.append((off - gap, cur, gap, 0, 254))
+                with open(path, 'rb') as in_f:
+                    u = off
                     while True:
                         buf = in_f.read(CHUNK_MAX)
                         if not buf:
                             break
-                        c_buf = lz4.block.compress(buf, store_size=False)
-                        cflag = 3 if len(c_buf) < len(buf) else 0
-                        cdata = c_buf if cflag == 3 else buf
-                        csz = len(cdata)
-                        out_f.write(cdata)
-                        chunks_meta.append((file_uoff, cur_coff, len(buf), csz, cflag))
-                        file_uoff += len(buf)
-                        cur_coff += csz
-                        pad = (16 - (cur_coff % 16)) % 16
-                        if pad:
-                            out_f.write(b'\x00' * pad)
-                            cur_coff += pad
+                        put(u, buf)
+                        u += len(buf)
+                if u != off + sz:
+                    raise IOError(f"{path} changed size while packing")
+                if verbose and (i % 25 == 0 or i == len(recs)):
+                    print(f"  [Packing {i}/{len(recs)}] ({i / len(recs) * 100:5.1f}%) {canon}")
 
-                if verbose and (file_idx % 25 == 0 or file_idx == len(final_file_records)):
-                    pct = (file_idx / len(final_file_records)) * 100
-                    print(f"  [Packing {file_idx}/{len(final_file_records)}] ({pct:5.1f}%) {canon_name}")
-
-            # Write header and chunk table at offset 0
+            assert len(chunks) == n_chunks
             out_f.seek(0)
-            dsar_hdr = bytearray(32)
-            dsar_hdr[:4] = b'DSAR'
-            struct.pack_into('<HHI', dsar_hdr, 4, 3, 1, len(chunks_meta))
-            struct.pack_into('<I', dsar_hdr, 12, first_chunk_offset)
-            struct.pack_into('<Q', dsar_hdr, 16, total_uncomp)
-            dsar_hdr[24:32] = b'PADDING*'
-            out_f.write(dsar_hdr)
+            hdr = bytearray(32)
+            hdr[:4] = b'DSAR'
+            struct.pack_into('<HHII', hdr, 4, 3, 1, len(chunks), first_chunk_offset)
+            struct.pack_into('<Q', hdr, 16, total_uncomp)
+            hdr[24:32] = b'PADDING*'
+            out_f.write(hdr)
+            for c in chunks:
+                out_f.write(struct.pack('<QQIIB7s', *c, b'\x55' * 7))
 
-            for uoff, coff, usz, csz, cflag in chunks_meta:
-                entry = struct.pack('<QQIIB7s', uoff, coff, usz, csz, cflag, b'\x55'*7)
-                out_f.write(entry)
-
-        if os.path.isfile(output_path):
-            os.remove(output_path)
-        os.rename(temp_output, output_path)
-
-    elif format_type.lower() == 'psar':
-        # Standard uncompressed/zlib Sony PSAR
-        temp_output = output_path + ".tmp"
+    elif fmt == 'psar':
         with open(temp_output, 'wb') as out_f:
             out_f.write(toc_data)
             out_f.write(filenames_bytes)
-            file_idx = 0
-            for canon_name, full_path, sz, zidx, off in final_file_records:
-                file_idx += 1
-                with open(full_path, 'rb') as in_f:
+            for canon, path, sz, zidx, off, gap in recs:
+                out_f.write(b'\x00' * gap)
+                with open(path, 'rb') as in_f:
                     while True:
                         buf = in_f.read(CHUNK_MAX)
                         if not buf:
                             break
                         out_f.write(buf)
-
-                if verbose and (file_idx % 25 == 0 or file_idx == len(final_file_records)):
-                    pct = (file_idx / len(final_file_records)) * 100
-                    print(f"  [Packing {file_idx}/{len(final_file_records)}] ({pct:5.1f}%) {canon_name}")
-
-        if os.path.isfile(output_path):
-            os.remove(output_path)
-        os.rename(temp_output, output_path)
-
     else:
         raise ValueError(f"Unknown format: {format_type}. Choose 'dsar' or 'psar'.")
 
-    elapsed = time.time() - t0
-    final_sz = os.path.getsize(output_path)
+    if os.path.isfile(output_path):
+        os.remove(output_path)
+    os.rename(temp_output, output_path)
+
     if verbose:
         print(f"[+] Successfully repacked into {output_path}")
-        print(f"    Final Archive Size: {final_sz / (1024*1024):.2f} MB | Elapsed: {elapsed:.2f}s")
+        print(f"    Final Archive Size: {os.path.getsize(output_path) / (1024*1024):.2f} MB | Elapsed: {time.time() - t0:.2f}s")
 
 
 def list_archive(archive_path):
@@ -633,6 +581,7 @@ Examples:
     p_pack.add_argument('directory', help='Input directory to pack')
     p_pack.add_argument('output', nargs='?', default=None, help='Output .psarc path (optional)')
     p_pack.add_argument('--format', choices=['dsar', 'psar'], default='dsar', help="Archive format ('dsar' for GoT PC DirectStorage, 'psar' for Sony standard)")
+    p_pack.add_argument('--add-new', action='store_true', help='also pack files that are not listed in Filenames.txt')
 
     # list
     p_list = subparsers.add_parser('list', aliases=['l'], help='List archive contents without extracting')
@@ -664,7 +613,7 @@ Examples:
     if args.command in ('unpack', 'x', 'extract'):
         unpack_archive(args.archive, args.output)
     elif args.command in ('pack', 'c', 'repack'):
-        pack_archive(args.directory, args.output, format_type=args.format)
+        pack_archive(args.directory, args.output, format_type=args.format, add_new=args.add_new)
     elif args.command in ('list', 'l'):
         list_archive(args.archive)
     else:

@@ -7,6 +7,14 @@
 
 A high-performance, memory-efficient extractor and repacker for **Ghost of Tsushima DIRECTOR'S CUT** (PC) archive files (`.psarc`).
 
+
+> **Repack layout fix.** `pack` now reproduces the layout of the original game archives exactly
+> (tested: TOC, zsizes and DSAR chunk table identical to the originals after unpack → pack):
+> files larger than 2 MiB start on a 64 KiB boundary (zero gap block, chunk flag 254), and every chunk is LZ4
+> (flag 3; the old version wrote some raw flag-0 chunks the originals never use). `Filenames.txt` may be
+> newline- or NUL-separated (UnPSARC format), and files that are not listed in it (backups, scripts, `.git`, …)
+> are no longer packed unless you pass `--add-new`.
+
 ---
 
 ## 🎯 Why This Tool?
@@ -109,7 +117,7 @@ For modders and reverse engineers interested in the container layout:
 | 0x08 - 0x0F : compressed_offset (uint64, 16-byte aligned)   |
 | 0x10 - 0x13 : uncompressed_size (uint32, max 262144 bytes)  |
 | 0x14 - 0x17 : compressed_size (uint32, 0 if padding)        |
-| 0x18        : compression_flag (3=LZ4 block, 0=raw, 254=pad)|
+| 0x18        : compression_flag (3=LZ4 block, 254=zero gap)  |
 | 0x19 - 0x1F : 7 bytes padding (b'\x55'*7)                   |
 +-------------------------------------------------------------+
 | Payload                                                     |
